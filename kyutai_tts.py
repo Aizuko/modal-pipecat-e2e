@@ -1,24 +1,25 @@
 import asyncio
 import time
 import json
+from concurrent.futures import ThreadPoolExecutor
 
 import modal
 
 app = modal.App("kyutai-tts")
 
 UVICORN_PORT = 8000
-TTS_SAMPLE_RATE = 24000
-DEFAULT_VOICE = "expresso/ex04-ex03_fast_001_channel1_208s.wav"
+DEFAULT_SPEAKER = "Ryan"
 
 tts_cache = modal.Volume.from_name("kyutai-tts-cache", create_if_missing=True)
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .apt_install("ffmpeg")
+    .apt_install("ffmpeg", "libsndfile1")
     .uv_pip_install(
-        "moshi>=0.2.11",
+        "qwen-tts",
         "torch",
-        "sphn",
+        "torchaudio",
+        "numpy",
         "fastapi[standard]",
         "uvicorn[standard]",
     )
@@ -28,10 +29,8 @@ image = (
 with image.imports():
     import numpy as np
     import torch
-    from moshi.models.loaders import CheckpointInfo
-    from moshi.models.tts import DEFAULT_DSM_TTS_REPO, DEFAULT_DSM_TTS_VOICE_REPO, TTSModel
+    from qwen_tts import Qwen3TTSModel
     from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-    from starlette.websockets import WebSocketState
     import threading
     import uvicorn
 
@@ -50,18 +49,23 @@ class KyutaiTTS:
         self.tunnel_ctx = None
         self.tunnel = None
         self.websocket_url = None
+        self._executor = ThreadPoolExecutor(max_workers=1)
 
-        print("Loading Kyutai TTS model...")
-        checkpoint_info = CheckpointInfo.from_hf_repo(DEFAULT_DSM_TTS_REPO)
-        self.tts_model = TTSModel.from_checkpoint_info(
-            checkpoint_info, n_q=32, temp=0.6, device="cuda"
+        print("Loading Qwen3-TTS model...")
+        self.tts_model = Qwen3TTSModel.from_pretrained(
+            "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            device_map="cuda:0",
+            dtype=torch.bfloat16,
+            attn_implementation="sdpa",
         )
-        self.default_voice_path = self.tts_model.get_voice_path(DEFAULT_VOICE)
+        tts_cache.commit()
 
-        # warm up
         print("Warming up TTS...")
-        for _ in range(3):
-            list(self._stream_tts("Hello, how are you today?"))
+        self.tts_model.generate_custom_voice(
+            text="Hello, how are you today?",
+            language="Auto",
+            speaker=DEFAULT_SPEAKER,
+        )
         print("TTS warmed up")
 
     @modal.enter()
@@ -70,54 +74,32 @@ class KyutaiTTS:
 
         @self.web_app.websocket("/ws")
         async def run_with_websocket(ws: WebSocket):
-            prompt_queue = asyncio.Queue()
-            audio_queue = asyncio.Queue()
-
-            async def recv_loop(ws, prompt_queue):
+            await ws.accept()
+            try:
                 while True:
                     msg = await ws.receive_text()
                     try:
                         data = json.loads(msg)
-                        if data.get("type") == "prompt":
-                            await prompt_queue.put(data)
                     except Exception:
                         continue
-
-            async def inference_loop(prompt_queue, audio_queue):
-                while True:
-                    prompt_msg = await prompt_queue.get()
-                    text = prompt_msg["text"]
-                    voice = prompt_msg.get("voice", DEFAULT_VOICE)
-                    for chunk in self._stream_tts(text, voice=voice):
-                        await audio_queue.put(chunk)
-
-            async def send_loop(audio_queue, ws):
-                while True:
-                    audio = await audio_queue.get()
-                    await ws.send_bytes(audio)
-
-            await ws.accept()
-            try:
-                tasks = [
-                    asyncio.create_task(recv_loop(ws, prompt_queue)),
-                    asyncio.create_task(inference_loop(prompt_queue, audio_queue)),
-                    asyncio.create_task(send_loop(audio_queue, ws)),
-                ]
-                await asyncio.gather(*tasks)
+                    if data.get("type") != "prompt":
+                        continue
+                    text = data["text"]
+                    speaker = data.get("speaker", DEFAULT_SPEAKER)
+                    print(f"[TTS] Synthesizing: {text[:80]!r}")
+                    t0 = time.time()
+                    loop = asyncio.get_event_loop()
+                    audio_bytes = await loop.run_in_executor(
+                        self._executor, self._synthesize, text, speaker
+                    )
+                    elapsed = time.time() - t0
+                    print(f"[TTS] Done in {elapsed:.2f}s, {len(audio_bytes)//2 if audio_bytes else 0} samples")
+                    if audio_bytes:
+                        await ws.send_bytes(audio_bytes)
             except WebSocketDisconnect:
                 pass
             except Exception as e:
                 print(f"WS error: {e}")
-            finally:
-                if ws and ws.application_state is WebSocketState.CONNECTED:
-                    await ws.close(code=1011)
-                for task in tasks:
-                    if not task.done():
-                        task.cancel()
-                        try:
-                            await task
-                        except asyncio.CancelledError:
-                            pass
 
         def start_server():
             uvicorn.run(self.web_app, host="0.0.0.0", port=UVICORN_PORT)
@@ -130,40 +112,17 @@ class KyutaiTTS:
         self.websocket_url = self.tunnel.url.replace("https://", "wss://") + "/ws"
         print(f"Websocket URL: {self.websocket_url}")
 
-    def _stream_tts(self, text, voice=None):
-        if voice is None or voice == DEFAULT_VOICE:
-            voice_path = self.default_voice_path
-        elif voice.endswith(".safetensors"):
-            voice_path = voice
-        else:
-            voice_path = self.tts_model.get_voice_path(voice)
-
-        entries = self.tts_model.prepare_script([text], padding_between=1)
-        condition_attributes = self.tts_model.make_condition_attributes(
-            [voice_path], cfg_coef=2.0
+    def _synthesize(self, text, speaker=DEFAULT_SPEAKER):
+        wavs, sr = self.tts_model.generate_custom_voice(
+            text=text,
+            language="Auto",
+            speaker=speaker,
+            max_new_tokens=1024,
         )
-
-        frames_collected = []
-        all_pcm = []
-
-        def _on_frame(frame):
-            if (frame != -1).all():
-                frames_collected.append(frame)
-
-        with self.tts_model.mimi.streaming(1), torch.no_grad():
-            self.tts_model.generate(
-                [entries], [condition_attributes], on_frame=_on_frame
-            )
-
-            for frame in frames_collected:
-                pcm = self.tts_model.mimi.decode(frame[:, 1:, :]).cpu().detach().numpy()
-                pcm = np.clip(pcm[0, 0], -1, 1)
-                all_pcm.append(pcm)
-
-        if all_pcm:
-            full_pcm = np.concatenate(all_pcm)
-            audio_int16 = (full_pcm * 32767).astype(np.int16)
-            yield audio_int16.tobytes()
+        if wavs:
+            pcm = np.clip(wavs[0], -1, 1)
+            return (pcm * 32767).astype(np.int16).tobytes()
+        return None
 
     @modal.method()
     async def run_tunnel_client(self, d: modal.Dict):
