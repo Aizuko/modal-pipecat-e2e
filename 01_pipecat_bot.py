@@ -4,7 +4,7 @@ import sys
 import time
 import uuid
 import base64
-from typing import AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Optional
 
 import modal
 
@@ -59,7 +59,33 @@ from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.llm_service import FunctionCallParams
 from pipecat.processors.aggregators.llm_response import LLMUserAggregatorParams
+
+# ---------------------------------------------------------------------------
+# In-memory session config store (keyed by session_id, auto-expires)
+# ---------------------------------------------------------------------------
+
+SESSION_TTL_SECS = 300  # 5 minutes
+# Each entry: {"system_prompt": ..., "tools": ..., "config": ..., "_ts": float}
+_sessions: dict[str, dict[str, Any]] = {}
+
+
+def _prune_sessions():
+    """Remove expired sessions."""
+    now = time.time()
+    expired = [
+        sid for sid, s in _sessions.items()
+        if now - s.get("_ts", 0) > SESSION_TTL_SECS
+    ]
+    for sid in expired:
+        del _sessions[sid]
+
+
+DEFAULT_SYSTEM_PROMPT = """\
+You are a Canadian voice assistant. As with all things Canadian, all your replies must work in be in both french and english, no matter if the user is speaking in french or english. Always reply first in English, then repeat the exact same reply in French.
+Keep your responses concise and conversational — ideally 1-3 sentences. Reply only in plain text, never use formatting.
+"""
 
 
 class ModalTunnelManager:
@@ -282,7 +308,21 @@ class ModalKyutaiTTSService(TTSService, ModalWebsocketService):
 log_dict = modal.Dict.from_name("voice-agent-logs", create_if_missing=True)
 
 
-async def run_bot(webrtc_connection: SmallWebRTCConnection):
+async def run_bot(
+    webrtc_connection: SmallWebRTCConnection,
+    bot_config: Optional[dict[str, Any]] = None,
+):
+    """Run the voice bot pipeline.
+
+    Args:
+        webrtc_connection: The WebRTC connection for audio I/O.
+        bot_config: Optional configuration dict with keys:
+            - system_prompt (str): System prompt for the LLM.
+            - tools (list): OpenAI-format tool/function definitions.
+            - config (dict): Extra LLM params like temperature.
+    """
+    bot_config = bot_config or {}
+
     stt_tunnel = ModalTunnelManager(app_name="parakeet-stt", cls_name="Transcriber")
     tts_tunnel = ModalTunnelManager(app_name="kyutai-tts", cls_name="KyutaiTTS")
     await stt_tunnel.start()
@@ -301,33 +341,50 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection):
 
     stt = ModalParakeetSTTService(modal_tunnel_manager=stt_tunnel)
 
-    llm = OpenAILLMService(
-        api_key="not-needed",
-        base_url=VLLM_BASE_URL,
-        model="llm",
-    )
+    llm_kwargs: dict[str, Any] = {
+        "api_key": "not-needed",
+        "base_url": VLLM_BASE_URL,
+        "model": "llm",
+    }
+    extra_config = bot_config.get("config", {})
+    if "temperature" in extra_config:
+        llm_kwargs["params"] = {"extra_body": {"temperature": extra_config["temperature"]}}
+
+    llm = OpenAILLMService(**llm_kwargs)
 
     tts = ModalKyutaiTTSService(modal_tunnel_manager=tts_tunnel, sample_rate=24000)
 
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                """\
-You are a Canadian voice assistant. As with all things Canadian, all your replies must work in be in both french and english, no matter if the user is speaking in french or english. Always reply first in English, then repeat the exact same reply in French.
-Keep your responses concise and conversational — ideally 1-3 sentences. Reply only in plain text, never use formatting.
-"""
-            ),
-        },
-    ]
+    # --- System prompt ---
+    system_prompt = bot_config.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
+    messages = [{"role": "system", "content": system_prompt}]
 
-    context = OpenAILLMContext(messages)
+    # --- Tools ---
+    tools = bot_config.get("tools", None)
+    context = OpenAILLMContext(messages, tools=tools)
     context_aggregator = llm.create_context_aggregator(
         context,
         user_params=LLMUserAggregatorParams(aggregation_timeout=0.05),
     )
 
     rtvi = RTVIProcessor()
+
+    # Register a catch-all function handler that forwards every tool call
+    # to the client via the RTVI llm-function-call message.  The client is
+    # responsible for executing the function and (optionally) returning a
+    # result.  We register one handler per tool name so Pipecat dispatches
+    # correctly.
+    if tools:
+        for tool_def in tools:
+            fn_name = tool_def.get("function", {}).get("name") if tool_def.get("type") == "function" else None
+            if not fn_name:
+                continue
+
+            async def _forward_to_client(params: FunctionCallParams, _rtvi=rtvi):
+                """Forward the function call to the RTVI client."""
+                await _rtvi.handle_function_call(params)
+
+            llm.register_function(fn_name, _forward_to_client)
+            logger.info(f"Registered client-side tool: {fn_name}")
 
     pipeline = Pipeline([
         transport.input(),
@@ -397,6 +454,12 @@ class VoiceAgent:
             ice_servers = await d.get.aio("ice_servers")
             ice_servers = [IceServer(**s) for s in ice_servers]
 
+            # Read optional bot config from the dict
+            try:
+                bot_config = await d.get.aio("bot_config")
+            except KeyError:
+                bot_config = None
+
             conn = SmallWebRTCConnection(ice_servers)
             await conn.initialize(sdp=offer["sdp"], type=offer["type"])
 
@@ -404,7 +467,7 @@ class VoiceAgent:
             async def handle_closed(conn):
                 logger.info("WebRTC closed")
 
-            bot_task = asyncio.create_task(run_bot(conn))
+            bot_task = asyncio.create_task(run_bot(conn, bot_config=bot_config))
             answer = conn.get_answer()
             await d.put.aio("answer", answer)
             await bot_task
@@ -420,8 +483,9 @@ class VoiceAgent:
 # Frontend
 # ---------------------------------------------------------------------------
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse
+from starlette.middleware.cors import CORSMiddleware
 
 
 FRONTEND_HTML = """<!DOCTYPE html>
@@ -518,17 +582,59 @@ FRONTEND_HTML = """<!DOCTYPE html>
 def serve_frontend():
     web_app = FastAPI()
 
+    # --- CORS ---
+    web_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
     @web_app.get("/")
     async def root():
         return HTMLResponse(FRONTEND_HTML)
 
+    @web_app.post("/configure")
+    async def configure(request: Request):
+        """Pre-configure a session with a system prompt, tools, and LLM config.
+
+        Accepts JSON body: {system_prompt?: str, tools?: list, config?: dict}
+        Returns: {session_id: str}
+        """
+        body = await request.json()
+        _prune_sessions()
+
+        session_id = str(uuid.uuid4())
+        _sessions[session_id] = {
+            "system_prompt": body.get("system_prompt"),
+            "tools": body.get("tools"),
+            "config": body.get("config"),
+            "_ts": time.time(),
+        }
+        logger.info(f"Created session {session_id}")
+        return {"session_id": session_id}
+
     @web_app.post("/offer")
-    async def offer(offer: dict):
+    async def offer(
+        offer: dict,
+        session_id: Optional[str] = Query(default=None),
+    ):
         ice_servers = [{"urls": "stun:stun.l.google.com:19302"}]
 
         d = modal.Dict.from_name(f"offer-{uuid.uuid4()}", create_if_missing=True)
         await d.put.aio("ice_servers", ice_servers)
         await d.put.aio("offer", offer)
+
+        # Look up pre-configured session and pass bot_config via the dict
+        if session_id and session_id in _sessions:
+            session = _sessions.pop(session_id)
+            bot_config = {
+                k: v for k, v in session.items()
+                if k != "_ts" and v is not None
+            }
+            if bot_config:
+                await d.put.aio("bot_config", bot_config)
+                logger.info(f"Applied session config for {session_id}")
 
         bot_call = await VoiceAgent().run_bot.spawn.aio(d)
 
