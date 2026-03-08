@@ -3,7 +3,7 @@
 This repository contains example code to self-host local LLMs on modal. This can
 easily be adapted to any locally host GPU setup to ensure privacy.
 
-This includes a basic front end interface in `bot.py` for testing purposes.
+This includes a basic front end interface in `01_pipecat_bot.py` for testing purposes.
 
 # Deploy Instructions
 
