@@ -154,18 +154,15 @@ class KyutaiTTS:
                 [entries], [condition_attributes], on_frame=_on_frame
             )
 
-        for frame in frames_collected:
-            pcm = self.tts_model.mimi.decode(frame[:, 1:, :]).cpu().detach().numpy()
-            pcm = np.clip(pcm[0, 0], -1, 1)
-            all_pcm.append(pcm)
+            for frame in frames_collected:
+                pcm = self.tts_model.mimi.decode(frame[:, 1:, :]).cpu().detach().numpy()
+                pcm = np.clip(pcm[0, 0], -1, 1)
+                all_pcm.append(pcm)
 
         if all_pcm:
             full_pcm = np.concatenate(all_pcm)
             audio_int16 = (full_pcm * 32767).astype(np.int16)
-            # Send in ~0.5s chunks (24kHz * 0.5 = 12000 samples)
-            chunk_size = 12000
-            for i in range(0, len(audio_int16), chunk_size):
-                yield audio_int16[i:i + chunk_size].tobytes()
+            yield audio_int16.tobytes()
 
     @modal.method()
     async def run_tunnel_client(self, d: modal.Dict):

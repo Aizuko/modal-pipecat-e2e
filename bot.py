@@ -295,7 +295,7 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection):
             audio_in_sample_rate=16000,
             audio_out_enabled=True,
             audio_out_sample_rate=24000,
-            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
+            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.8)),
         ),
     )
 
@@ -307,7 +307,7 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection):
         model="llm",
     )
 
-    tts = ModalKyutaiTTSService(modal_tunnel_manager=tts_tunnel)
+    tts = ModalKyutaiTTSService(modal_tunnel_manager=tts_tunnel, sample_rate=24000)
 
     messages = [
         {
