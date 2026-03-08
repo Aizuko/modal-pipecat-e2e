@@ -8,7 +8,7 @@ app = modal.App("kyutai-tts")
 
 UVICORN_PORT = 8000
 TTS_SAMPLE_RATE = 24000
-DEFAULT_VOICE = "expresso/ex03-ex01_happy_001_channel1_334s.wav"
+DEFAULT_VOICE = "expresso/ex04-ex03_fast_001_channel1_208s.wav"
 
 tts_cache = modal.Volume.from_name("kyutai-tts-cache", create_if_missing=True)
 

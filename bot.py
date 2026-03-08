@@ -221,7 +221,7 @@ class ModalKyutaiTTSService(TTSService, ModalWebsocketService):
             self,
             pause_frame_processing=True,
             push_stop_frames=True,
-            push_text_frames=False,
+            push_text_frames=True,
             stop_frame_timeout_s=1.0,
             **kwargs,
         )
@@ -269,6 +269,7 @@ class ModalKyutaiTTSService(TTSService, ModalWebsocketService):
             if self._voice:
                 msg["voice"] = self._voice
             await self._websocket.send(json.dumps(msg))
+            await self.push_frame(prompt)
         except Exception as e:
             yield ErrorFrame(f"TTS send error: {e}")
             return
