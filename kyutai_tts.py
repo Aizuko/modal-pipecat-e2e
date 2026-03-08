@@ -74,32 +74,60 @@ class KyutaiTTS:
 
         @self.web_app.websocket("/ws")
         async def run_with_websocket(ws: WebSocket):
-            await ws.accept()
-            try:
+            prompt_queue = asyncio.Queue()
+            audio_queue = asyncio.Queue()
+
+            async def recv_loop():
                 while True:
                     msg = await ws.receive_text()
                     try:
                         data = json.loads(msg)
+                        if data.get("type") == "prompt":
+                            await prompt_queue.put(data)
                     except Exception:
                         continue
-                    if data.get("type") != "prompt":
-                        continue
-                    text = data["text"]
-                    speaker = data.get("speaker", DEFAULT_SPEAKER)
+
+            async def inference_loop():
+                loop = asyncio.get_event_loop()
+                while True:
+                    prompt_msg = await prompt_queue.get()
+                    text = prompt_msg["text"]
+                    speaker = prompt_msg.get("speaker", DEFAULT_SPEAKER)
                     print(f"[TTS] Synthesizing: {text[:80]!r}")
                     t0 = time.time()
-                    loop = asyncio.get_event_loop()
                     audio_bytes = await loop.run_in_executor(
                         self._executor, self._synthesize, text, speaker
                     )
-                    elapsed = time.time() - t0
-                    print(f"[TTS] Done in {elapsed:.2f}s, {len(audio_bytes)//2 if audio_bytes else 0} samples")
+                    print(f"[TTS] Done in {time.time()-t0:.2f}s")
                     if audio_bytes:
-                        await ws.send_bytes(audio_bytes)
+                        await audio_queue.put(audio_bytes)
+
+            async def send_loop():
+                while True:
+                    audio = await audio_queue.get()
+                    await ws.send_bytes(audio)
+
+            await ws.accept()
+            tasks = []
+            try:
+                tasks = [
+                    asyncio.create_task(recv_loop()),
+                    asyncio.create_task(inference_loop()),
+                    asyncio.create_task(send_loop()),
+                ]
+                await asyncio.gather(*tasks)
             except WebSocketDisconnect:
                 pass
             except Exception as e:
                 print(f"WS error: {e}")
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
 
         def start_server():
             uvicorn.run(self.web_app, host="0.0.0.0", port=UVICORN_PORT)
