@@ -1,11 +1,18 @@
-# Voice Agent — Deploy Instructions
+# ReadyFormAI modal infrastructure
+
+This repository contains example code to self-host local LLMs on modal. This can
+easily be adapted to any locally host GPU setup to ensure privacy.
+
+This includes a basic front end interface in `bot.py` for testing purposes.
+
+# Deploy Instructions
 
 ## Architecture
 
 ```
-Browser ↔ WebRTC ↔ Bot (CPU) ↔ WS tunnel ↔ Parakeet STT (L40S GPU)
-                              ↔ HTTP      ↔ vLLM LLM (L40S GPU)
-                              ↔ WS tunnel ↔ Kyutai TTS (L40S GPU)
+Browser ↔ WebRTC ↔ Bot (CPU) ↔ WS tunnel ↔ Parakeet v0.3 STT (L40S GPU)
+                              ↔ HTTP      ↔ Qwen3 30b a3b on vLLM  (L40S GPU)
+                              ↔ WS tunnel ↔ Qwen3 TTS (L40S GPU)
 ```
 
 ## Prerequisites
