@@ -38,7 +38,7 @@ from websockets.protocol import State
 from pipecat.frames.frames import (
     ErrorFrame, Frame, StartFrame, EndFrame, CancelFrame,
     TranscriptionFrame, TTSAudioRawFrame, TTSStartedFrame, TTSStoppedFrame,
-    LLMRunFrame,
+    LLMRunFrame, TextFrame,
 )
 from pipecat.services.websocket_service import WebsocketService
 from pipecat.services.tts_service import TTSService
@@ -269,7 +269,7 @@ class ModalKyutaiTTSService(TTSService, ModalWebsocketService):
             if self._voice:
                 msg["voice"] = self._voice
             await self._websocket.send(json.dumps(msg))
-            await self.push_frame(prompt)
+            await self.push_frame(TextFrame(text=prompt))
         except Exception as e:
             yield ErrorFrame(f"TTS send error: {e}")
             return
