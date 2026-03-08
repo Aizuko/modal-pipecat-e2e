@@ -41,6 +41,7 @@ with image.imports():
     volumes={"/cache": tts_cache},
     gpu="L40S",
     scaledown_window=30 * 60,
+    timeout=10 * 60,
 )
 @modal.concurrent(max_inputs=10)
 class KyutaiTTS:

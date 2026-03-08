@@ -91,6 +91,7 @@ class NoStdStreams:
     enable_memory_snapshot=True,
     experimental_options={"enable_gpu_snapshot": True},
     scaledown_window=30 * 60,
+    timeout=10 * 60,
 )
 @modal.concurrent(max_inputs=20)
 class Transcriber:
