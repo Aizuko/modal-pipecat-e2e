@@ -42,6 +42,7 @@ image = (
 )
 
 with image.imports():
+    import io
     import numpy as np
     import logging
     import nemo.collections.asr as nemo_asr
@@ -54,6 +55,16 @@ with image.imports():
 
 
 def _bytes_to_torch(data):
+    # Handle WAV format (from pipecat's SegmentedSTTService)
+    if data[:4] == b'RIFF':
+        import soundfile as sf
+        audio, sr = sf.read(io.BytesIO(data), dtype="float32")
+        if sr != 16000:
+            import torchaudio
+            t = torch.from_numpy(audio).unsqueeze(0)
+            t = torchaudio.functional.resample(t, sr, 16000)
+            return t.squeeze(0)
+        return torch.from_numpy(audio)
     arr = np.frombuffer(data, dtype=np.int16).astype("float32") / 32768.0
     return torch.from_numpy(arr)
 

@@ -279,6 +279,9 @@ class ModalKyutaiTTSService(TTSService, ModalWebsocketService):
 # Bot pipeline
 # ---------------------------------------------------------------------------
 
+log_dict = modal.Dict.from_name("voice-agent-logs", create_if_missing=True)
+
+
 async def run_bot(webrtc_connection: SmallWebRTCConnection):
     stt_tunnel = ModalTunnelManager(app_name="parakeet-stt", cls_name="Transcriber")
     tts_tunnel = ModalTunnelManager(app_name="kyutai-tts", cls_name="KyutaiTTS")
@@ -343,6 +346,20 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection):
         ),
         observers=[RTVIObserver(rtvi)],
     )
+
+    @stt.event_handler("on_stt_update")
+    async def on_stt_update(stt, frame):
+        logger.info(f"[STT] {frame.text!r}")
+
+    @llm.event_handler("on_llm_context_updated")
+    async def on_llm_context_updated(llm, frame):
+        msgs = frame.context.get_messages()
+        logger.info(f"[LLM] Context has {len(msgs)} messages:")
+        for m in msgs:
+            role = m.get("role", "?")
+            content = m.get("content", "")
+            if content:
+                logger.info(f"  [{role}] {content[:200]}")
 
     @rtvi.event_handler("on_client_ready")
     async def on_client_ready(rtvi):
@@ -410,12 +427,11 @@ FRONTEND_HTML = """<!DOCTYPE html>
 <head>
     <title>Voice Agent</title>
     <style>
-        body { font-family: sans-serif; max-width: 600px; margin: 40px auto; padding: 0 20px; }
+        body { font-family: sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; }
         button { padding: 12px 24px; font-size: 16px; cursor: pointer; margin: 8px 4px; }
         #status { margin: 16px 0; font-weight: bold; }
-        #transcript { white-space: pre-wrap; background: #f5f5f5; padding: 16px; border-radius: 8px; min-height: 100px; margin-top: 16px; }
-        .connected { color: green; }
-        .disconnected { color: red; }
+        #logs { white-space: pre-wrap; background: #1e1e1e; color: #d4d4d4; padding: 16px; border-radius: 8px; min-height: 200px; max-height: 500px; overflow-y: auto; margin-top: 16px; font-family: monospace; font-size: 13px; }
+        .connected { color: green; }        .disconnected { color: red; }
     </style>
 </head>
 <body>
@@ -423,11 +439,9 @@ FRONTEND_HTML = """<!DOCTYPE html>
     <button id="startBtn" onclick="start()">Start Conversation</button>
     <button id="stopBtn" onclick="stop()" disabled>Stop</button>
     <div id="status" class="disconnected">Disconnected</div>
-    <div id="transcript"></div>
 
     <script>
     let pc = null;
-    let audioCtx = null;
 
     async function start() {
         document.getElementById('startBtn').disabled = true;
@@ -456,7 +470,6 @@ FRONTEND_HTML = """<!DOCTYPE html>
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
 
-            // Wait for ICE gathering
             await new Promise(resolve => {
                 if (pc.iceGatheringState === 'complete') resolve();
                 else pc.onicegatheringcomplete = resolve;
@@ -486,10 +499,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
     }
 
     function stop() {
-        if (pc) {
-            pc.close();
-            pc = null;
-        }
+        if (pc) { pc.close(); pc = null; }
         document.getElementById('status').textContent = 'Disconnected';
         document.getElementById('status').className = 'disconnected';
         document.getElementById('startBtn').disabled = false;

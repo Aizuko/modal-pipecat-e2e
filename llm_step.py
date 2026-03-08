@@ -114,3 +114,18 @@ class VllmServer:
     @modal.exit()
     def stop(self):
         self.vllm_proc.terminate()
+
+
+if __name__ == "__main__":
+    import time
+    cls = modal.Cls.from_name("readyformai-llm-step", "VllmServer")
+    for _ in range(3):
+        start = time.time()
+        resp = requests.post(
+            "https://aizuko--readyformai-llm-step-vllmserver-serve.modal.run/v1/chat/completions",
+            json={"model": "llm", "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 16},
+            timeout=300,
+        )
+        resp.raise_for_status()
+        print(f"Response ({time.time() - start:.2f}s): {resp.json()['choices'][0]['message']['content'][:80]}")
+        time.sleep(1)
