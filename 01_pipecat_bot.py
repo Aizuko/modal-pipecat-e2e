@@ -636,16 +636,14 @@ def serve_frontend():
 
     @web_app.post("/offer")
     async def offer(
-        offer: dict,
+        request: Request,
         session_id: Optional[str] = Query(default=None),
     ):
-        ice_servers = [{"urls": "stun:stun.l.google.com:19302"}]
+        body = await request.json()
+        ice_servers = [IceServer(urls="stun:stun.l.google.com:19302")]
 
-        d = modal.Dict.from_name(f"offer-{uuid.uuid4()}", create_if_missing=True)
-        await d.put.aio("ice_servers", ice_servers)
-        await d.put.aio("offer", offer)
-
-        # Look up pre-configured session and pass bot_config via the dict
+        # Look up pre-configured session
+        bot_config = None
         if session_id and session_id in _sessions:
             session = _sessions.pop(session_id)
             bot_config = {
@@ -653,24 +651,23 @@ def serve_frontend():
                 if k != "_ts" and v is not None
             }
             if bot_config:
-                await d.put.aio("bot_config", bot_config)
                 logger.info(f"Applied session config for {session_id}")
 
-        logger.info(f"Spawning VoiceAgent for offer (session_id={session_id})")
-        bot_call = await VoiceAgent().run_bot.spawn.aio(d)
-        logger.info(f"VoiceAgent spawned, waiting for answer...")
+        # Create WebRTC connection and initialize directly
+        conn = SmallWebRTCConnection(ice_servers)
+        await conn.initialize(sdp=body["sdp"], type=body["type"])
 
-        try:
-            for i in range(300):  # 30s timeout
-                if await d.contains.aio("answer"):
-                    logger.info(f"Got answer after {i * 0.1:.1f}s")
-                    return await d.get.aio("answer")
-                await asyncio.sleep(0.1)
-            raise TimeoutError("Bot did not produce answer in time")
-        except Exception as e:
-            logger.error(f"Offer error: {e}")
-            await bot_call.cancel.aio()
-            raise e
+        @conn.event_handler("closed")
+        async def handle_closed(conn):
+            logger.info("WebRTC closed")
+
+        # Run bot pipeline as background task
+        asyncio.create_task(run_bot(conn, bot_config=bot_config))
+
+        # Return answer immediately
+        answer = conn.get_answer()
+        logger.info(f"Returning SDP answer for session_id={session_id}")
+        return answer
 
     return web_app
 
