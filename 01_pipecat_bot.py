@@ -1,10 +1,8 @@
 import asyncio
 import json
-import sys
-import time
-import uuid
 import base64
-from typing import AsyncGenerator, Optional
+import uuid
+from typing import AsyncGenerator
 
 import modal
 
@@ -28,6 +26,287 @@ bot_image = (
 )
 
 # ---------------------------------------------------------------------------
+# Hardcoded configuration
+# ---------------------------------------------------------------------------
+
+SYSTEM_PROMPT = """\
+# ReadyFormAI Voice Assistant
+
+You are ReadyFormAI, a patient, friendly voice assistant designed to help users fill out PDF forms.
+
+---
+
+## MOST IMPORTANT RULE
+
+**DO NOT output speech/text when you are making tool calls.**
+
+Speech and tool calls DO NOT MIX. Pick ONE per turn:
+- Making tool calls? -> Output ONLY tool calls, no text
+- Need to speak? -> Output ONLY speech, no tool calls
+
+### WHY?
+
+When you output both speech AND tools, the speech plays FIRST while tools run in silence. The conversation breaks because:
+1. Your speech plays
+2. User starts responding
+3. Tools are still running in the background
+4. Everything gets out of sync
+
+### CORRECT PATTERN
+
+User gives info -> You output ONLY tool calls (no speech) -> Tools run -> You speak in your next turn
+
+**Example:**
+User: "My name is Oliver Chen and I'm filing for overtime"
+You: [tool calls only - NO SPEECH]
+[tools execute]
+You (next turn): "Got it Oliver! What dates does the overtime cover?"
+
+### WRONG PATTERN (NEVER DO THIS)
+
+User: "My name is Oliver Chen"
+You: "Great, filling that in! What else?" [setFieldValue: Name, Oliver Chen]
+
+This breaks because "Great, filling that in!" plays BEFORE the tool runs!
+
+---
+
+## Your Purpose
+
+Fill out the form using tools. Make tool calls immediately when user gives information.
+
+## Tool Usage
+
+- **setFieldValue** - Enter data into fields
+- **getFieldValue** - Check a field's current value
+- **focusField** - Highlight a field (auto-scrolls)
+- **navigateToSection** - Jump to a form section
+- **getFormProgress** - Check completion percentage
+- **getFormSummary** - Review all values
+- **confirmValue** - Mark a field as confirmed
+- **showHelp** - Show help for a field
+- **showTooltip** - Display field tooltip popup
+- **hangUp** - End call and show completed PDF
+
+Make MULTIPLE tool calls in one turn if user gives multiple pieces of info.
+
+## Intelligent Behavior
+
+### 1. Multi-Field Extraction
+When the user provides multiple pieces of information in one sentence, fill ALL relevant fields:
+- User: "I'm Frank Miller delivering wheat from 123 Farm Lane"
+- Turn 1: [setFieldValue: Producer Name, Frank Miller] [setFieldValue: Grain Type, Wheat] [setFieldValue: Address, 123 Farm Lane]
+- Turn 2 (after results): "Got it, Frank. I've entered your name, grain type, and address."
+
+### 2. Automatic Unit Conversion
+Check the field's unit and convert if the user gives a different unit.
+- If a weight field expects tonnes but user says "45,000 kilograms": enter "45"
+- Always tell the user about conversions in your next turn.
+
+### 3. Date Handling
+Convert relative dates to actual dates in YYYY-MM-DD format. NEVER enter text like "two weeks ago".
+
+### 4. Checkbox and Boolean Fields
+Normalize: "yes"/"check it"/"true" -> "Yes" or "checked"; "no"/"uncheck"/"false" -> "No" or ""
+
+### 5. Smart Field Inference
+Use context to determine which fields to fill:
+- "ticket number is GR-89" -> probably the Scale Ticket field
+- Mention of weight -> determine if gross or vehicle from context
+
+## Response Style (for speech-only turns)
+
+Be brief:
+- WRONG: "I have successfully updated the Producer Name field to Frank Miller."
+- RIGHT: "Got it, Frank! Ticket number?"
+
+Keep momentum - don't over-confirm every field.
+
+## Starting the Conversation
+
+"Hi! Let's fill out your form. What would you like to start with?"
+
+Or just listen and fill as they speak.
+
+## Key Rules
+
+1. NO speech when making tool calls - most important!
+2. Fill multiple fields at once when user gives multiple values
+3. Convert units silently, explain after
+4. Keep speech brief - confirm and move forward
+5. Use tools actively - nothing happens without them
+6. Use hangUp with reason "completed" when user says they're done
+"""
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "setFieldValue",
+            "description": "Set a form field value. Use when user provides information.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "fieldName": {
+                        "type": "string",
+                        "description": "The exact field name to update",
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "The value to set (always as a string)",
+                    },
+                },
+                "required": ["fieldName", "value"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "getFieldValue",
+            "description": "Get the current value of a form field.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "fieldName": {
+                        "type": "string",
+                        "description": "The field name to retrieve",
+                    },
+                },
+                "required": ["fieldName"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "focusField",
+            "description": "Highlight a field in the UI and scroll to it.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "fieldName": {
+                        "type": "string",
+                        "description": "The field name to highlight",
+                    },
+                },
+                "required": ["fieldName"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "navigateToSection",
+            "description": "Scroll to and highlight a specific section of the form.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sectionId": {
+                        "type": "string",
+                        "description": "The section ID to navigate to",
+                    },
+                },
+                "required": ["sectionId"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "getFormProgress",
+            "description": "Get form completion progress (completed/total fields and percentage).",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "getFormSummary",
+            "description": "Get complete form summary with all field values.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "confirmValue",
+            "description": "Mark a field as confirmed by the user.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "fieldName": {
+                        "type": "string",
+                        "description": "The field name that was confirmed",
+                    },
+                },
+                "required": ["fieldName"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "showHelp",
+            "description": "Show help information for a field or general topic.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": "Topic to explain (field name or 'general')",
+                    },
+                },
+                "required": ["topic"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "showTooltip",
+            "description": "Display the tooltip/description popup for a specific field.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "fieldName": {
+                        "type": "string",
+                        "description": "The field name to show tooltip for",
+                    },
+                },
+                "required": ["fieldName"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "hangUp",
+            "description": "End the call and show the completed PDF. Use when user says they are done, finished, or wants to submit.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "Reason for ending",
+                        "enum": ["completed", "user_requested"],
+                    },
+                },
+                "required": ["reason"],
+            },
+        },
+    },
+]
+
+# ---------------------------------------------------------------------------
 # Service bridge classes
 # ---------------------------------------------------------------------------
 
@@ -36,9 +315,15 @@ from websockets.asyncio.client import connect as websocket_connect
 from websockets.protocol import State
 
 from pipecat.frames.frames import (
-    ErrorFrame, Frame, StartFrame, EndFrame, CancelFrame,
-    TranscriptionFrame, TTSAudioRawFrame, TTSStartedFrame, TTSStoppedFrame,
-    LLMRunFrame,
+    ErrorFrame,
+    Frame,
+    StartFrame,
+    EndFrame,
+    CancelFrame,
+    TranscriptionFrame,
+    TTSAudioRawFrame,
+    TTSStartedFrame,
+    TTSStoppedFrame,
 )
 from pipecat.services.websocket_service import WebsocketService
 from pipecat.services.tts_service import TTSService
@@ -51,7 +336,8 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.frameworks.rtvi import RTVIObserver, RTVIProcessor
 from pipecat.transports.smallwebrtc.connection import (
-    IceServer, SmallWebRTCConnection,
+    IceServer,
+    SmallWebRTCConnection,
 )
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.transports.base_transport import TransportParams
@@ -75,7 +361,9 @@ class ModalTunnelManager:
 
     async def start(self):
         await self._url_dict.put.aio("is_running", True)
-        self.function_call = await self._cls.run_tunnel_client.spawn.aio(self._url_dict)
+        self.function_call = await self._cls.run_tunnel_client.spawn.aio(
+            self._url_dict
+        )
 
     async def get_url(self):
         while not await self._url_dict.contains.aio("url"):
@@ -279,8 +567,6 @@ class ModalKyutaiTTSService(TTSService, ModalWebsocketService):
 # Bot pipeline
 # ---------------------------------------------------------------------------
 
-log_dict = modal.Dict.from_name("voice-agent-logs", create_if_missing=True)
-
 
 async def run_bot(webrtc_connection: SmallWebRTCConnection):
     stt_tunnel = ModalTunnelManager(app_name="parakeet-stt", cls_name="Transcriber")
@@ -305,23 +591,13 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection):
         api_key="not-needed",
         base_url=VLLM_BASE_URL,
         model="llm",
+        params=OpenAILLMService.InputParams(temperature=0),
     )
 
     tts = ModalKyutaiTTSService(modal_tunnel_manager=tts_tunnel, sample_rate=24000)
 
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                """\
-You are a Canadian voice assistant. As with all things Canadian, all your replies must work in be in both french and english, no matter if the user is speaking in french or english. Always reply first in English, then repeat the exact same reply in French.
-Keep your responses concise and conversational — ideally 1-3 sentences. Reply only in plain text, never use formatting.
-"""
-            ),
-        },
-    ]
-
-    context = OpenAILLMContext(messages)
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    context = OpenAILLMContext(messages, tools=TOOLS)
     context_aggregator = llm.create_context_aggregator(
         context,
         user_params=LLMUserAggregatorParams(aggregation_timeout=0.05),
@@ -329,16 +605,24 @@ Keep your responses concise and conversational — ideally 1-3 sentences. Reply 
 
     rtvi = RTVIProcessor()
 
-    pipeline = Pipeline([
-        transport.input(),
-        rtvi,
-        stt,
-        context_aggregator.user(),
-        llm,
-        tts,
-        transport.output(),
-        context_aggregator.assistant(),
-    ])
+    # Register RTVI tool handlers on the LLM so function calls are
+    # forwarded to the client natively via the data channel.
+    for tool in TOOLS:
+        fn_name = tool["function"]["name"]
+        llm.register_function(fn_name, rtvi.handle_function_call)
+
+    pipeline = Pipeline(
+        [
+            transport.input(),
+            rtvi,
+            stt,
+            context_aggregator.user(),
+            llm,
+            tts,
+            transport.output(),
+            context_aggregator.assistant(),
+        ]
+    )
 
     task = PipelineTask(
         pipeline,
@@ -376,180 +660,60 @@ Keep your responses concise and conversational — ideally 1-3 sentences. Reply 
 
 
 # ---------------------------------------------------------------------------
-# Modal containers: bot + frontend
-# ---------------------------------------------------------------------------
-
-@app.cls(
-    image=bot_image,
-    timeout=30 * MINUTES,
-    enable_memory_snapshot=True,
-    max_inputs=1,
-)
-class VoiceAgent:
-    @modal.enter(snap=True)
-    def load(self):
-        pass
-
-    @modal.method()
-    async def run_bot(self, d: modal.Dict):
-        try:
-            offer = await d.get.aio("offer")
-            ice_servers = await d.get.aio("ice_servers")
-            ice_servers = [IceServer(**s) for s in ice_servers]
-
-            conn = SmallWebRTCConnection(ice_servers)
-            await conn.initialize(sdp=offer["sdp"], type=offer["type"])
-
-            @conn.event_handler("closed")
-            async def handle_closed(conn):
-                logger.info("WebRTC closed")
-
-            bot_task = asyncio.create_task(run_bot(conn))
-            answer = conn.get_answer()
-            await d.put.aio("answer", answer)
-            await bot_task
-        except Exception as e:
-            raise RuntimeError(f"Bot error: {e}")
-
-    @modal.method()
-    def ping(self):
-        return "pong"
-
-
-# ---------------------------------------------------------------------------
-# Frontend
+# Web server
 # ---------------------------------------------------------------------------
 
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 
-FRONTEND_HTML = """<!DOCTYPE html>
-<html>
-<head>
-    <title>Voice Agent</title>
-    <style>
-        body { font-family: sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; }
-        button { padding: 12px 24px; font-size: 16px; cursor: pointer; margin: 8px 4px; }
-        #status { margin: 16px 0; font-weight: bold; }
-        #logs { white-space: pre-wrap; background: #1e1e1e; color: #d4d4d4; padding: 16px; border-radius: 8px; min-height: 200px; max-height: 500px; overflow-y: auto; margin-top: 16px; font-family: monospace; font-size: 13px; }
-        .connected { color: green; }        .disconnected { color: red; }
-    </style>
-</head>
-<body>
-    <h1>Voice Agent</h1>
-    <button id="startBtn" onclick="start()">Start Conversation</button>
-    <button id="stopBtn" onclick="stop()" disabled>Stop</button>
-    <div id="status" class="disconnected">Disconnected</div>
-
-    <script>
-    let pc = null;
-
-    async function start() {
-        document.getElementById('startBtn').disabled = true;
-        document.getElementById('status').textContent = 'Connecting...';
-
-        try {
-            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            pc = new RTCPeerConnection({
-                iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
-            });
-
-            stream.getTracks().forEach(t => pc.addTrack(t, stream));
-
-            pc.ontrack = (event) => {
-                const audio = new Audio();
-                audio.srcObject = event.streams[0];
-                audio.play();
-            };
-
-            pc.oniceconnectionstatechange = () => {
-                if (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed') {
-                    stop();
-                }
-            };
-
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
-
-            await new Promise(resolve => {
-                if (pc.iceGatheringState === 'complete') resolve();
-                else pc.onicegatheringcomplete = resolve;
-                pc.onicecandidate = e => { if (!e.candidate) resolve(); };
-            });
-
-            const resp = await fetch('/offer', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    sdp: pc.localDescription.sdp,
-                    type: pc.localDescription.type,
-                }),
-            });
-
-            const answer = await resp.json();
-            await pc.setRemoteDescription(answer);
-
-            document.getElementById('status').textContent = 'Connected';
-            document.getElementById('status').className = 'connected';
-            document.getElementById('stopBtn').disabled = false;
-        } catch (e) {
-            console.error(e);
-            document.getElementById('status').textContent = 'Error: ' + e.message;
-            document.getElementById('startBtn').disabled = false;
-        }
-    }
-
-    function stop() {
-        if (pc) { pc.close(); pc = null; }
-        document.getElementById('status').textContent = 'Disconnected';
-        document.getElementById('status').className = 'disconnected';
-        document.getElementById('startBtn').disabled = false;
-        document.getElementById('stopBtn').disabled = true;
-    }
-    </script>
-</body>
-</html>"""
-
-
-@app.function(image=bot_image, min_containers=1)
+@app.function(image=bot_image, min_containers=1, timeout=30 * MINUTES)
 @modal.asgi_app()
 @modal.concurrent(max_inputs=100)
 def serve_frontend():
     web_app = FastAPI()
 
+    # CORS middleware - allow all origins for frontend connectivity
+    web_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # Global exception handler so 500 errors include CORS headers
+    @web_app.exception_handler(Exception)
+    async def global_exception_handler(request: Request, exc: Exception):
+        logger.error(f"Unhandled exception: {exc}")
+        return JSONResponse(
+            status_code=500,
+            content={"detail": str(exc)},
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "*",
+                "Access-Control-Allow-Headers": "*",
+            },
+        )
+
     @web_app.get("/")
-    async def root():
-        return HTMLResponse(FRONTEND_HTML)
+    async def health():
+        return {"status": "ok"}
 
     @web_app.post("/offer")
-    async def offer(offer: dict):
-        ice_servers = [{"urls": "stun:stun.l.google.com:19302"}]
+    async def offer(body: dict):
+        """Direct WebRTC connection - no session_id checks."""
+        ice_servers = [IceServer(urls="stun:stun.l.google.com:19302")]
+        conn = SmallWebRTCConnection(ice_servers)
+        await conn.initialize(sdp=body["sdp"], type=body["type"])
+        asyncio.create_task(run_bot(conn))
+        return conn.get_answer()
 
-        d = modal.Dict.from_name(f"offer-{uuid.uuid4()}", create_if_missing=True)
-        await d.put.aio("ice_servers", ice_servers)
-        await d.put.aio("offer", offer)
-
-        bot_call = await VoiceAgent().run_bot.spawn.aio(d)
-
-        try:
-            for _ in range(300):  # 30s timeout
-                if await d.contains.aio("answer"):
-                    return await d.get.aio("answer")
-                await asyncio.sleep(0.1)
-            raise TimeoutError("Bot did not produce answer in time")
-        except Exception as e:
-            logger.error(f"Offer error: {e}")
-            bot_call.cancel()
-            raise e
+    @web_app.patch("/offer")
+    async def patch_offer():
+        """Absorb late ICE candidates."""
+        return {"status": "ok"}
 
     return web_app
-
-
-if __name__ == "__main__":
-    bot = modal.Cls.from_name(APP_NAME, "VoiceAgent")
-    for _ in range(5):
-        start = time.time()
-        bot().ping.remote()
-        print(f"Ping: {time.time() - start:.3f}s")
-        time.sleep(10.0)
