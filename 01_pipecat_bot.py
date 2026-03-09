@@ -616,6 +616,13 @@ def serve_frontend():
         logger.info(f"Created session {session_id}")
         return {"session_id": session_id}
 
+    @web_app.patch("/offer")
+    async def offer_ice(request: Request):
+        """Accept ICE trickle candidates. Since we use waitForICEGathering on the
+        client, all candidates are included in the initial POST SDP, so these
+        trickle candidates are redundant. Return 200 to prevent 405 errors."""
+        return {}
+
     @web_app.post("/offer")
     async def offer(
         offer: dict,
