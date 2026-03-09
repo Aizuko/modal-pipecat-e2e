@@ -656,17 +656,20 @@ def serve_frontend():
                 await d.put.aio("bot_config", bot_config)
                 logger.info(f"Applied session config for {session_id}")
 
+        logger.info(f"Spawning VoiceAgent for offer (session_id={session_id})")
         bot_call = await VoiceAgent().run_bot.spawn.aio(d)
+        logger.info(f"VoiceAgent spawned, waiting for answer...")
 
         try:
-            for _ in range(300):  # 30s timeout
+            for i in range(300):  # 30s timeout
                 if await d.contains.aio("answer"):
+                    logger.info(f"Got answer after {i * 0.1:.1f}s")
                     return await d.get.aio("answer")
                 await asyncio.sleep(0.1)
             raise TimeoutError("Bot did not produce answer in time")
         except Exception as e:
             logger.error(f"Offer error: {e}")
-            bot_call.cancel()
+            await bot_call.cancel.aio()
             raise e
 
     return web_app
