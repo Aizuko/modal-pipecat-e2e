@@ -589,6 +589,7 @@ class VoiceAgent:
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 
 FRONTEND_HTML = """<!DOCTYPE html>
@@ -684,6 +685,12 @@ FRONTEND_HTML = """<!DOCTYPE html>
 @modal.concurrent(max_inputs=100)
 def serve_frontend():
     web_app = FastAPI()
+    web_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
     @web_app.get("/")
     async def root():
