@@ -59,7 +59,10 @@ from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.llm_service import FunctionCallParams
 from pipecat.processors.aggregators.llm_response import LLMUserAggregatorParams
+from pipecat.adapters.schemas.function_schema import FunctionSchema
+from pipecat.adapters.schemas.tools_schema import ToolsSchema
 
 
 class ModalTunnelManager:
@@ -282,6 +285,126 @@ class ModalKyutaiTTSService(TTSService, ModalWebsocketService):
 log_dict = modal.Dict.from_name("voice-agent-logs", create_if_missing=True)
 
 
+SYSTEM_PROMPT = """\
+You are ReadyFormAI, a patient, friendly voice assistant that helps users fill out PDF forms.
+
+DO NOT output speech/text when you are making tool calls. Speech and tool calls DO NOT MIX. Pick ONE per turn:
+- Making tool calls? Output ONLY tool calls, no text.
+- Need to speak? Output ONLY speech, no tool calls.
+
+User gives info -> You output ONLY tool calls (no speech) -> Tools run -> You speak in your next turn.
+
+Tool Usage:
+- setFieldValue: Enter data into fields. Use the exact field name.
+- getFieldValue: Read current value of a field.
+- focusField: Highlight and scroll to a field.
+- confirmValue: Mark a field as confirmed by user.
+- showHelp: Show help for a field or "general".
+- showTooltip: Show tooltip popup for a field.
+- navigateToSection: Jump to a form section by ID.
+- getFormProgress: Get completion percentage.
+- getFormSummary: Get all current values.
+- hangUp: End call and show completed PDF. Use when user says "done", "finished", "submit".
+
+Make MULTIPLE tool calls in one turn if user gives multiple pieces of info.
+
+Intelligent Behavior:
+- Extract multiple fields from one sentence.
+- Convert units silently (e.g. kg to tonnes). Mention conversion after tools complete.
+- For date fields, ALWAYS enter actual dates in YYYY-MM-DD format, never relative text like "two weeks ago".
+- For checkboxes: "yes"/"check it" -> "Yes" or "checked". "no"/"uncheck" -> "No" or "".
+- Use context to infer which field the user means.
+- On corrections, update the field immediately.
+
+Response Style (speech-only turns):
+- Be brief. "Got it, Frank! Ticket number?" not "I have successfully updated the Producer Name field."
+- Keep momentum, don't over-confirm every field.
+
+When no form context has been received yet, greet the user and let them know you're waiting for the form to load.
+When form context arrives, greet with: "Hi! Let's fill out your [form title]. What would you like to start with?"
+"""
+
+READYFORM_TOOLS = ToolsSchema(standard_tools=[
+    FunctionSchema(
+        name="setFieldValue",
+        description="Set a form field value.",
+        properties={
+            "fieldName": {"type": "string", "description": "Exact field name to update"},
+            "value": {"type": "string", "description": "Value to set"},
+        },
+        required=["fieldName", "value"],
+    ),
+    FunctionSchema(
+        name="getFieldValue",
+        description="Get current value of a form field.",
+        properties={
+            "fieldName": {"type": "string", "description": "Field name to read"},
+        },
+        required=["fieldName"],
+    ),
+    FunctionSchema(
+        name="focusField",
+        description="Highlight a field in the UI and scroll to it.",
+        properties={
+            "fieldName": {"type": "string", "description": "Field to highlight"},
+        },
+        required=["fieldName"],
+    ),
+    FunctionSchema(
+        name="confirmValue",
+        description="Mark a field as confirmed by user.",
+        properties={
+            "fieldName": {"type": "string", "description": "Field that was confirmed"},
+        },
+        required=["fieldName"],
+    ),
+    FunctionSchema(
+        name="showHelp",
+        description="Show help for a field or general topic.",
+        properties={
+            "topic": {"type": "string", "description": "Field name or 'general'"},
+        },
+        required=["topic"],
+    ),
+    FunctionSchema(
+        name="showTooltip",
+        description="Show tooltip popup for a field.",
+        properties={
+            "fieldName": {"type": "string", "description": "Field to show tooltip for"},
+        },
+        required=["fieldName"],
+    ),
+    FunctionSchema(
+        name="navigateToSection",
+        description="Scroll to a form section.",
+        properties={
+            "sectionId": {"type": "string", "description": "Section ID to navigate to"},
+        },
+        required=["sectionId"],
+    ),
+    FunctionSchema(
+        name="getFormProgress",
+        description="Get form completion progress.",
+        properties={},
+        required=[],
+    ),
+    FunctionSchema(
+        name="getFormSummary",
+        description="Get complete form summary with all current values.",
+        properties={},
+        required=[],
+    ),
+    FunctionSchema(
+        name="hangUp",
+        description="End the call and show the completed PDF. Use when user says done/finished/submit.",
+        properties={
+            "reason": {"type": "string", "enum": ["completed", "user_requested"], "description": "Reason for ending"},
+        },
+        required=["reason"],
+    ),
+])
+
+
 async def run_bot(webrtc_connection: SmallWebRTCConnection):
     stt_tunnel = ModalTunnelManager(app_name="parakeet-stt", cls_name="Transcriber")
     tts_tunnel = ModalTunnelManager(app_name="kyutai-tts", cls_name="KyutaiTTS")
@@ -309,23 +432,48 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection):
 
     tts = ModalKyutaiTTSService(modal_tunnel_manager=tts_tunnel, sample_rate=24000)
 
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                """\
-You are a Canadian voice assistant. As with all things Canadian, all your replies must work in be in both french and english, no matter if the user is speaking in french or english. Always reply first in English, then repeat the exact same reply in French.
-Keep your responses concise and conversational — ideally 1-3 sentences. Reply only in plain text, never use formatting.
-"""
-            ),
-        },
-    ]
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-    context = OpenAILLMContext(messages)
+    context = OpenAILLMContext(messages, tools=READYFORM_TOOLS)
     context_aggregator = llm.create_context_aggregator(
         context,
         user_params=LLMUserAggregatorParams(aggregation_timeout=0.05),
     )
+
+    # --- Client-side tool execution via data channel ---
+    # Tool handlers send calls to the client and wait for results.
+    pending_tool_results: dict[str, asyncio.Future] = {}
+
+    async def client_tool_handler(params: FunctionCallParams):
+        """Generic handler: forward tool call to client, wait for result."""
+        call_id = params.tool_call_id
+        future = asyncio.get_event_loop().create_future()
+        pending_tool_results[call_id] = future
+
+        msg = json.dumps({
+            "type": "tool_call",
+            "id": call_id,
+            "name": params.function_name,
+            "args": dict(params.arguments),
+        })
+        await transport.send_app_message(msg, None)
+        logger.info(f"[Tool] Sent to client: {params.function_name}({dict(params.arguments)})")
+
+        try:
+            result = await asyncio.wait_for(future, timeout=10.0)
+        except asyncio.TimeoutError:
+            result = {"error": f"Tool {params.function_name} timed out waiting for client"}
+        finally:
+            pending_tool_results.pop(call_id, None)
+
+        await params.result_callback(result)
+
+    for tool_name in [
+        "setFieldValue", "getFieldValue", "focusField", "confirmValue",
+        "showHelp", "showTooltip", "navigateToSection",
+        "getFormProgress", "getFormSummary", "hangUp",
+    ]:
+        llm.register_function(tool_name, client_tool_handler)
 
     rtvi = RTVIProcessor()
 
@@ -349,19 +497,38 @@ Keep your responses concise and conversational — ideally 1-3 sentences. Reply 
         observers=[RTVIObserver(rtvi)],
     )
 
+    @transport.event_handler("on_app_message")
+    async def on_app_message(transport, message, sender):
+        try:
+            data = json.loads(message) if isinstance(message, str) else message
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(f"[App] Invalid message: {message}")
+            return
+
+        msg_type = data.get("type")
+
+        if msg_type == "tool_result":
+            call_id = data.get("id")
+            future = pending_tool_results.get(call_id)
+            if future and not future.done():
+                future.set_result(data.get("result", {}))
+            else:
+                logger.warning(f"[App] No pending future for tool_result id={call_id}")
+
+        elif msg_type == "form_context":
+            # Client sends form field info after PDF is loaded.
+            # Inject into the system message so the LLM knows the fields.
+            form_info = data.get("content", "")
+            if form_info:
+                updated_prompt = SYSTEM_PROMPT + "\n\n## Current Form Context\n\n" + form_info
+                msgs = context.get_messages()
+                if msgs and msgs[0].get("role") == "system":
+                    msgs[0]["content"] = updated_prompt
+                logger.info(f"[App] Updated system prompt with form context ({len(form_info)} chars)")
+
     @stt.event_handler("on_stt_update")
     async def on_stt_update(stt, frame):
         logger.info(f"[STT] {frame.text!r}")
-
-    @llm.event_handler("on_llm_context_updated")
-    async def on_llm_context_updated(llm, frame):
-        msgs = frame.context.get_messages()
-        logger.info(f"[LLM] Context has {len(msgs)} messages:")
-        for m in msgs:
-            role = m.get("role", "?")
-            content = m.get("content", "")
-            if content:
-                logger.info(f"  [{role}] {content[:200]}")
 
     @rtvi.event_handler("on_client_ready")
     async def on_client_ready(rtvi):
