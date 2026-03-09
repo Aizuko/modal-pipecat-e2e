@@ -484,7 +484,7 @@ class VoiceAgent:
 # ---------------------------------------------------------------------------
 
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from starlette.middleware.cors import CORSMiddleware
 
 
@@ -589,6 +589,17 @@ def serve_frontend():
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # Ensure CORS headers are present even on 500 errors, since unhandled
+    # exceptions bypass the CORSMiddleware in some FastAPI/Starlette versions.
+    @web_app.exception_handler(Exception)
+    async def unhandled_exception_handler(request: Request, exc: Exception):
+        logger.error(f"Unhandled exception: {exc}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(exc)},
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
 
     @web_app.get("/")
     async def root():
