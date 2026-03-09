@@ -95,6 +95,8 @@ class VllmServer:
             "--enforce-eager",
             "--tensor-parallel-size", str(N_GPU),
             "--enable-sleep-mode",
+            "--enable-auto-tool-choice",
+            "--tool-call-parser", "hermes"
         ]
         print(*cmd)
         self.vllm_proc = subprocess.Popen(cmd)
