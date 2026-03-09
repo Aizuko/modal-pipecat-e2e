@@ -311,6 +311,7 @@ log_dict = modal.Dict.from_name("voice-agent-logs", create_if_missing=True)
 async def run_bot(
     webrtc_connection: SmallWebRTCConnection,
     bot_config: Optional[dict[str, Any]] = None,
+    pipeline_ready: Optional[asyncio.Event] = None,
 ):
     """Run the voice bot pipeline.
 
@@ -320,6 +321,8 @@ async def run_bot(
             - system_prompt (str): System prompt for the LLM.
             - tools (list): OpenAI-format tool/function definitions.
             - config (dict): Extra LLM params like temperature.
+        pipeline_ready: Event set when the pipeline is about to start,
+            so the caller knows RTVI messages will be processed.
     """
     bot_config = bot_config or {}
 
@@ -429,6 +432,12 @@ async def run_bot(
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
         await task.cancel()
+
+    # Signal that the pipeline is ready to process RTVI messages.
+    # The /offer handler waits for this before returning the SDP answer,
+    # ensuring the client's RTVI handshake (client-ready → bot-ready) succeeds.
+    if pipeline_ready:
+        pipeline_ready.set()
 
     runner = PipelineRunner()
     await runner.run(task)
@@ -658,12 +667,20 @@ def serve_frontend():
         async def handle_closed(conn):
             logger.info("WebRTC closed")
 
-        # Run bot pipeline as background task
-        asyncio.create_task(run_bot(conn, bot_config=bot_config))
+        # Run bot pipeline as background task, wait for it to be ready
+        pipeline_ready = asyncio.Event()
+        asyncio.create_task(
+            run_bot(conn, bot_config=bot_config, pipeline_ready=pipeline_ready)
+        )
 
-        # Return answer immediately
+        # Wait for the pipeline to be ready before returning the answer.
+        # This ensures the RTVI handshake (client-ready → bot-ready) will
+        # succeed when the client connects.
+        logger.info("Waiting for pipeline to be ready...")
+        await asyncio.wait_for(pipeline_ready.wait(), timeout=120)
+        logger.info("Pipeline ready, returning SDP answer")
+
         answer = conn.get_answer()
-        logger.info(f"Returning SDP answer for session_id={session_id}")
         return answer
 
     return web_app
