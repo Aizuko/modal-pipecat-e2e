@@ -38,7 +38,7 @@ from websockets.protocol import State
 from pipecat.frames.frames import (
     ErrorFrame, Frame, StartFrame, EndFrame, CancelFrame,
     TranscriptionFrame, TTSAudioRawFrame, TTSStartedFrame, TTSStoppedFrame,
-    LLMRunFrame,
+    LLMRunFrame, OutputTransportMessageFrame,
 )
 from pipecat.services.websocket_service import WebsocketService
 from pipecat.services.tts_service import TTSService
@@ -456,7 +456,7 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection):
             "name": params.function_name,
             "args": dict(params.arguments),
         })
-        await transport.send_app_message(msg, None)
+        await transport.output().send_message(OutputTransportMessageFrame(message=msg))
         logger.info(f"[Tool] Sent to client: {params.function_name}({dict(params.arguments)})")
 
         try:
