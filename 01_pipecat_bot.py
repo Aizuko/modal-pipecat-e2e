@@ -348,7 +348,9 @@ async def run_bot(
     }
     extra_config = bot_config.get("config", {})
     if "temperature" in extra_config:
-        llm_kwargs["params"] = {"extra_body": {"temperature": extra_config["temperature"]}}
+        llm_kwargs["params"] = OpenAILLMService.InputParams(
+            temperature=extra_config["temperature"],
+        )
 
     llm = OpenAILLMService(**llm_kwargs)
 
